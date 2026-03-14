@@ -5,6 +5,7 @@ import sys
 from dataclasses import dataclass, field
 
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -186,11 +187,12 @@ class RepoChatCLI:
         self.session.conversation.append({"role": "user", "content": question})
 
         full_response = ""
-        console.print()
+        console.print("[dim]...[/dim]", end="\r")
         async for chunk in _stream_claude(system, question):
-            print(chunk, end="", flush=True)
             full_response += chunk
-        print("\n")
+        console.print(" " * 10, end="\r")  # clear the "..." line
+        console.print(Markdown(full_response, justify="left"))
+        console.print()
 
         self.session.conversation.append({"role": "assistant", "content": full_response})
         return full_response
@@ -378,7 +380,6 @@ class RepoChatCLI:
                                 await self._fetch_selected(file_specs)
 
                     # Stage 3 — stream the answer
-                    console.print("[dim]Thinking...[/dim]", end="\r")
                     await self._answer(user_input)
                     self._show_context_summary()
 
