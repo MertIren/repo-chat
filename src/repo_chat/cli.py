@@ -4,7 +4,6 @@ import re
 import sys
 from dataclasses import dataclass, field
 
-import anthropic
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -15,7 +14,48 @@ from .url_parser import RepoSpec, parse_github_url
 
 console = Console()
 
-MODEL = "claude-sonnet-4-5"
+CLAUDE_CMD = ["claude", "--no-session-persistence", "--tools", ""]
+
+
+async def _call_claude(system: str, prompt: str) -> str:
+    """One-shot Claude call, returns full text response."""
+    proc = await asyncio.create_subprocess_exec(
+        *CLAUDE_CMD, "-p", prompt, "--system-prompt", system,
+        "--output-format", "text",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(stderr.decode().strip() or "claude CLI failed")
+    return stdout.decode().strip()
+
+
+async def _stream_claude(system: str, prompt: str):
+    """Async generator that yields text chunks as they stream from Claude."""
+    proc = await asyncio.create_subprocess_exec(
+        *CLAUDE_CMD, "-p", prompt, "--system-prompt", system,
+        "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    prev_len = 0
+    async for raw in proc.stdout:
+        line = raw.decode().strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "assistant":
+            for block in event.get("message", {}).get("content", []):
+                if block.get("type") == "text":
+                    full = block["text"]
+                    if len(full) > prev_len:
+                        yield full[prev_len:]
+                        prev_len = len(full)
+    await proc.wait()
 
 
 @dataclass
@@ -30,7 +70,6 @@ class RepoChatCLI:
     def __init__(self, initial_urls: list[str]) -> None:
         self.initial_urls = initial_urls
         self.gh = GitHubClient()
-        self.ac = anthropic.Anthropic()
         self.session = RepoChatSession()
 
     # ------------------------------------------------------------------
@@ -98,13 +137,7 @@ class RepoChatCLI:
             user_msg += f"## Already Fetched Files (reuse these if sufficient)\n{fetched}\n\n"
         user_msg += f"## Question\n{question}"
 
-        resp = self.ac.messages.create(
-            model=MODEL,
-            max_tokens=512,
-            system=system,
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        text = resp.content[0].text.strip()
+        text = await _call_claude(system, user_msg)
         # Strip markdown code fences if present
         m = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
         if m:
@@ -142,19 +175,21 @@ class RepoChatCLI:
         if fetched:
             system += f"\n\n## File Contents\n{fetched}"
 
+        # Embed prior conversation turns so the stateless CLI has context
+        if self.session.conversation:
+            history = "\n\n".join(
+                f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
+                for m in self.session.conversation
+            )
+            system += f"\n\n## Conversation so far\n{history}\n\nContinue the conversation by responding to the latest User message."
+
         self.session.conversation.append({"role": "user", "content": question})
 
         full_response = ""
         console.print()
-        with self.ac.messages.stream(
-            model=MODEL,
-            max_tokens=4096,
-            system=system,
-            messages=self.session.conversation,
-        ) as stream:
-            for text in stream.text_stream:
-                print(text, end="", flush=True)
-                full_response += text
+        async for chunk in _stream_claude(system, question):
+            print(chunk, end="", flush=True)
+            full_response += chunk
         print("\n")
 
         self.session.conversation.append({"role": "assistant", "content": full_response})
@@ -305,53 +340,56 @@ class RepoChatCLI:
         except ImportError:
             pass
 
-        while True:
-            try:
-                console.print(f"[bold green]{self._prompt()}[/bold green]", end="")
-                user_input = input()
-            except (EOFError, KeyboardInterrupt):
-                console.print("\n[dim]Goodbye![/dim]")
-                break
-
-            user_input = user_input.strip()
-            if not user_input:
-                continue
-
-            if user_input.startswith("/"):
-                if not await self._handle_command(user_input):
+        try:
+            while True:
+                try:
+                    console.print(f"[bold green]{self._prompt()}[/bold green]", end="")
+                    user_input = input()
+                except (EOFError, KeyboardInterrupt):
+                    console.print("\n[dim]Goodbye![/dim]")
                     break
-                continue
 
-            try:
-                # Stage 1 — decide which files to fetch
-                with console.status("[dim]Deciding which files to read...[/dim]"):
-                    file_specs = await self._select_files(user_input)
+                user_input = user_input.strip()
+                if not user_input:
+                    continue
 
-                # Stage 2 — fetch new files
-                if file_specs:
-                    new = [
-                        s for s in file_specs
-                        if (s["owner"], s["repo"], s["branch"], s["path"])
-                        not in self.session.fetched_files
-                    ]
-                    if new:
-                        repo_count = len({(s["owner"], s["repo"]) for s in new})
-                        with console.status(
-                            f"[dim]Fetching {len(new)} file(s) across {repo_count} repo(s)...[/dim]"
-                        ):
-                            await self._fetch_selected(file_specs)
+                if user_input.startswith("/"):
+                    if not await self._handle_command(user_input):
+                        break
+                    continue
 
-                # Stage 3 — stream the answer
-                console.print("[dim]Thinking...[/dim]", end="\r")
-                await self._answer(user_input)
-                self._show_context_summary()
+                try:
+                    # Stage 1 — decide which files to fetch
+                    with console.status("[dim]Deciding which files to read...[/dim]"):
+                        file_specs = await self._select_files(user_input)
 
-            except RateLimitError as e:
-                console.print(f"\n[red]Rate limit:[/red] {e}")
-            except Exception as e:
-                console.print(f"\n[red]Error:[/red] {e}")
+                    # Stage 2 — fetch new files
+                    if file_specs:
+                        new = [
+                            s for s in file_specs
+                            if (s["owner"], s["repo"], s["branch"], s["path"])
+                            not in self.session.fetched_files
+                        ]
+                        if new:
+                            repo_count = len({(s["owner"], s["repo"]) for s in new})
+                            with console.status(
+                                f"[dim]Fetching {len(new)} file(s) across {repo_count} repo(s)...[/dim]"
+                            ):
+                                await self._fetch_selected(file_specs)
 
-        await self.gh.aclose()
+                    # Stage 3 — stream the answer
+                    console.print("[dim]Thinking...[/dim]", end="\r")
+                    await self._answer(user_input)
+                    self._show_context_summary()
+
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    console.print("\n[dim]Cancelled.[/dim]\n")
+                except RateLimitError as e:
+                    console.print(f"\n[red]Rate limit:[/red] {e}")
+                except Exception as e:
+                    console.print(f"\n[red]Error:[/red] {e}")
+        finally:
+            await self.gh.aclose()
 
 
 def main() -> None:
@@ -364,4 +402,7 @@ def main() -> None:
         )
         sys.exit(0 if "--help" in sys.argv or "-h" in sys.argv else 1)
 
-    asyncio.run(RepoChatCLI(sys.argv[1:]).run())
+    try:
+        asyncio.run(RepoChatCLI(sys.argv[1:]).run())
+    except KeyboardInterrupt:
+        pass

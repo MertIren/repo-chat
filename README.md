@@ -12,7 +12,7 @@ Chat with GitHub repositories without cloning them. Ask questions about architec
 ## Installation
 
 ```bash
-git clone https://github.com/yourname/repo-chat
+git clone https://github.com/MertIren/repo-chat
 cd repo-chat
 pip install -e .
 ```
