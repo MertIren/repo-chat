@@ -4,11 +4,10 @@ import re
 import sys
 from dataclasses import dataclass, field
 
+from rich import box
 from rich.console import Console
 from rich.markdown import Markdown
-from rich.panel import Panel
 from rich.table import Table
-from rich.text import Text
 
 from .github_client import GitHubClient, RateLimitError
 from .url_parser import RepoSpec, parse_github_url
@@ -191,8 +190,9 @@ class RepoChatCLI:
         async for chunk in _stream_claude(system, question):
             full_response += chunk
         console.print(" " * 10, end="\r")  # clear the "..." line
+        console.rule(style="dim")
         console.print(Markdown(full_response, justify="left"))
-        console.print()
+        console.rule(style="dim")
 
         self.session.conversation.append({"role": "assistant", "content": full_response})
         return full_response
@@ -210,9 +210,9 @@ class RepoChatCLI:
         approx_tokens = total_chars // 4
         if not by_repo and not self.session.fetched_files:
             return
-        parts = [f"{repo}: {n} file(s)" for repo, n in by_repo.items()]
+        parts = [f"{repo}: {n} file{'s' if n != 1 else ''}" for repo, n in by_repo.items()]
         parts.append(f"~{approx_tokens:,} tokens")
-        console.print(f"[dim]Context: {' · '.join(parts)}[/dim]\n")
+        console.print(f"\n[dim italic]  \u21b3 {' \u00b7 '.join(parts)}[/dim italic]\n")
 
     # ------------------------------------------------------------------
     # Commands
@@ -255,9 +255,12 @@ class RepoChatCLI:
                     k = f"{owner}/{repo}@{branch}"
                     by_repo.setdefault(k, []).append(path)
                 for repo_key, paths in by_repo.items():
-                    console.print(f"[bold cyan]{repo_key}[/bold cyan]")
-                    for p in sorted(paths):
-                        console.print(f"  {p}")
+                    owner_repo, _, branch = repo_key.partition("@")
+                    console.print(f"[blue]{owner_repo}[/blue][dim]@{branch}[/dim]")
+                    sorted_paths = sorted(paths)
+                    for i, p in enumerate(sorted_paths):
+                        connector = "\u2514\u2500" if i == len(sorted_paths) - 1 else "\u251c\u2500"
+                        console.print(f"  [dim]{connector}[/dim] {p}")
 
         elif name == "/tree":
             target = arg.lower() if arg else None
@@ -267,9 +270,10 @@ class RepoChatCLI:
                     continue
                 key = f"{spec.owner}/{spec.repo}@{spec.branch}"
                 files = self.session.file_trees.get(key, [])
-                console.print(f"\n[bold cyan]{short}[/bold cyan] ({spec.branch}, {len(files)} files)")
-                for f in files:
-                    console.print(f"  {f}")
+                console.print(f"\n[blue]{short}[/blue][dim]@{spec.branch}[/dim] [dim]({len(files)} files)[/dim]")
+                for i, f in enumerate(files):
+                    connector = "\u2514\u2500" if i == len(files) - 1 else "\u251c\u2500"
+                    console.print(f"  [dim]{connector}[/dim] {f}")
 
         else:
             console.print(f"[yellow]Unknown command:[/yellow] {name}  (try /add, /clear, /files, /tree, /exit)")
@@ -281,12 +285,8 @@ class RepoChatCLI:
     # ------------------------------------------------------------------
 
     async def _startup(self) -> None:
-        console.print(
-            Panel.fit(
-                "[bold blue]repo-chat[/bold blue]  Ask questions about GitHub repositories without cloning them",
-                border_style="blue",
-            )
-        )
+        console.rule("[bold]repo-chat[/bold]", style="blue")
+        console.print("[dim]  Ask questions about GitHub repositories without cloning them[/dim]\n")
 
         errors: dict[str, str] = {}
         with console.status(f"[dim]Fetching {len(self.initial_urls)} repo(s)...[/dim]"):
@@ -304,7 +304,12 @@ class RepoChatCLI:
                 errors[url] = err
 
         if self.session.repos:
-            table = Table(title="Loaded Repositories", show_header=True, header_style="bold cyan")
+            table = Table(
+                show_header=True,
+                header_style="blue",
+                box=box.ROUNDED,
+                border_style="dim",
+            )
             table.add_column("Repository")
             table.add_column("Branch")
             table.add_column("Files", justify="right")
@@ -322,7 +327,12 @@ class RepoChatCLI:
             sys.exit(1)
 
         console.print(
-            "\n[dim]Commands: /add <url>  /clear  /files  /tree [repo]  /exit[/dim]\n"
+            "\n[dim]  /add <url>    add a repository\n"
+            "  /clear        reset conversation and file cache\n"
+            "  /files        list files in context\n"
+            "  /tree <repo>  show repository file tree\n"
+            "  /exit         quit[/dim]\n",
+            highlight=False,
         )
 
     # ------------------------------------------------------------------
@@ -330,8 +340,7 @@ class RepoChatCLI:
     # ------------------------------------------------------------------
 
     def _prompt(self) -> str:
-        names = [r.short_name() for r in self.session.repos]
-        return f"[{', '.join(names)}] > "
+        return ", ".join(r.short_name() for r in self.session.repos)
 
     async def run(self) -> None:
         await self._startup()
@@ -345,7 +354,7 @@ class RepoChatCLI:
         try:
             while True:
                 try:
-                    console.print(f"[bold green]{self._prompt()}[/bold green]", end="")
+                    console.print(f"[blue]{self._prompt()}[/blue] [bold]\u276f[/bold] ", end="")
                     user_input = input()
                 except (EOFError, KeyboardInterrupt):
                     console.print("\n[dim]Goodbye![/dim]")
@@ -399,7 +408,8 @@ def main() -> None:
             "Usage: [bold]repo-chat[/bold] <github-url> [<github-url> ...]\n\n"
             "Example:\n"
             "  repo-chat https://github.com/anthropics/anthropic-sdk-python\n"
-            "  repo-chat https://github.com/owner/repo1 https://github.com/owner/repo2"
+            "  repo-chat https://github.com/owner/repo1 https://github.com/owner/repo2",
+            highlight=False,
         )
         sys.exit(0 if "--help" in sys.argv or "-h" in sys.argv else 1)
 
