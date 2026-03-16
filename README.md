@@ -12,14 +12,24 @@ pip install -e .
 
 | Variable | Required | Description |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | Yes (CLI only) | Your Anthropic API key |
+| `ANTHROPIC_API_KEY` | Only when using the `claude` CLI backend | Your Anthropic API key |
 | `GITHUB_TOKEN` | Recommended | Raises GitHub rate limit from 60 to 5,000 req/hr; required for private repos |
 
 ---
 
 ## CLI
 
-An interactive REPL backed by Claude. Uses a two-stage pipeline: Claude first picks which files to read, then answers with their contents.
+An interactive REPL that uses a two-stage AI pipeline: the model first picks which files to read, then answers with their contents.
+
+By default it calls the `claude` CLI (Claude Code must be installed). To use a different model or provider, create a `.repo-chat.toml` file in your working directory:
+
+```toml
+api_key = "your-api-key"
+api_url = "https://api.openai.com/v1"   # any OpenAI-compatible endpoint
+model   = "gpt-4o"                       # optional
+```
+
+Works with ChatGPT (`https://api.openai.com/v1`) or Gemini (`https://generativelanguage.googleapis.com/v1beta/openai`), or any other OpenAI-compatible API. When the file is absent or empty, the `claude` CLI is used automatically.
 
 ```bash
 repo-chat https://github.com/owner/repo

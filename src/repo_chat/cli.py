@@ -4,23 +4,29 @@ import re
 import sys
 from dataclasses import dataclass, field
 
+import httpx
 from rich import box
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
 
+from .config import Config, load_config
 from .github_client import GitHubClient, RateLimitError
 from .url_parser import RepoSpec, parse_github_url
 
 console = Console()
 
-CLAUDE_CMD = ["claude", "--no-session-persistence", "--tools", ""]
+# ---------------------------------------------------------------------------
+# Claude CLI backend (default)
+# ---------------------------------------------------------------------------
+
+_CLAUDE_CMD = ["claude", "--no-session-persistence", "--tools", ""]
 
 
 async def _call_claude(system: str, prompt: str) -> str:
-    """One-shot Claude call, returns full text response."""
+    """One-shot Claude CLI call, returns full text response."""
     proc = await asyncio.create_subprocess_exec(
-        *CLAUDE_CMD, "-p", prompt, "--system-prompt", system,
+        *_CLAUDE_CMD, "-p", prompt, "--system-prompt", system,
         "--output-format", "text",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -32,9 +38,9 @@ async def _call_claude(system: str, prompt: str) -> str:
 
 
 async def _stream_claude(system: str, prompt: str):
-    """Async generator that yields text chunks as they stream from Claude."""
+    """Async generator that yields text chunks as they stream from Claude CLI."""
     proc = await asyncio.create_subprocess_exec(
-        *CLAUDE_CMD, "-p", prompt, "--system-prompt", system,
+        *_CLAUDE_CMD, "-p", prompt, "--system-prompt", system,
         "--output-format", "stream-json", "--verbose", "--include-partial-messages",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
@@ -58,6 +64,60 @@ async def _stream_claude(system: str, prompt: str):
     await proc.wait()
 
 
+# ---------------------------------------------------------------------------
+# Direct API backend (any OpenAI-compatible endpoint)
+# ---------------------------------------------------------------------------
+
+def _api_messages(system: str, prompt: str) -> list[dict]:
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": prompt},
+    ]
+
+
+async def _call_api(client: httpx.AsyncClient, cfg: Config, system: str, prompt: str) -> str:
+    """One-shot call to an OpenAI-compatible /chat/completions endpoint."""
+    body: dict = {"messages": _api_messages(system, prompt), "stream": False}
+    if cfg.model:
+        body["model"] = cfg.model
+    resp = await client.post(
+        f"{cfg.api_url}/chat/completions",
+        json=body,
+        headers={"Authorization": f"Bearer {cfg.api_key}"},
+        timeout=60.0,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
+
+
+async def _stream_api(client: httpx.AsyncClient, cfg: Config, system: str, prompt: str):
+    """Async generator that streams from an OpenAI-compatible SSE endpoint."""
+    body: dict = {"messages": _api_messages(system, prompt), "stream": True}
+    if cfg.model:
+        body["model"] = cfg.model
+    async with client.stream(
+        "POST",
+        f"{cfg.api_url}/chat/completions",
+        json=body,
+        headers={"Authorization": f"Bearer {cfg.api_key}"},
+        timeout=None,
+    ) as resp:
+        resp.raise_for_status()
+        async for line in resp.aiter_lines():
+            if not line.startswith("data: "):
+                continue
+            payload = line[6:]
+            if payload == "[DONE]":
+                break
+            try:
+                chunk = json.loads(payload)
+                content = chunk["choices"][0]["delta"].get("content", "")
+                if content:
+                    yield content
+            except (json.JSONDecodeError, KeyError, IndexError):
+                continue
+
+
 @dataclass
 class RepoChatSession:
     repos: list[RepoSpec] = field(default_factory=list)
@@ -67,10 +127,14 @@ class RepoChatSession:
 
 
 class RepoChatCLI:
-    def __init__(self, initial_urls: list[str]) -> None:
+    def __init__(self, initial_urls: list[str], cfg: Config | None = None) -> None:
         self.initial_urls = initial_urls
+        self.cfg = cfg or Config()
         self.gh = GitHubClient()
         self.session = RepoChatSession()
+        self._api: httpx.AsyncClient | None = (
+            httpx.AsyncClient() if self.cfg.use_direct_api else None
+        )
 
     # ------------------------------------------------------------------
     # Repo management
@@ -117,7 +181,24 @@ class RepoChatCLI:
         return "\n\n".join(parts)
 
     # ------------------------------------------------------------------
-    # Claude calls
+    # Backend dispatch helpers
+    # ------------------------------------------------------------------
+
+    async def _call(self, system: str, prompt: str) -> str:
+        if self.cfg.use_direct_api:
+            return await _call_api(self._api, self.cfg, system, prompt)
+        return await _call_claude(system, prompt)
+
+    async def _stream(self, system: str, prompt: str):
+        if self.cfg.use_direct_api:
+            async for chunk in _stream_api(self._api, self.cfg, system, prompt):
+                yield chunk
+        else:
+            async for chunk in _stream_claude(system, prompt):
+                yield chunk
+
+    # ------------------------------------------------------------------
+    # AI calls
     # ------------------------------------------------------------------
 
     async def _select_files(self, question: str) -> list[dict]:
@@ -137,7 +218,7 @@ class RepoChatCLI:
             user_msg += f"## Already Fetched Files (reuse these if sufficient)\n{fetched}\n\n"
         user_msg += f"## Question\n{question}"
 
-        text = await _call_claude(system, user_msg)
+        text = await self._call(system, user_msg)
         # Strip markdown code fences if present
         m = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
         if m:
@@ -187,7 +268,7 @@ class RepoChatCLI:
 
         full_response = ""
         console.print("[dim]...[/dim]", end="\r")
-        async for chunk in _stream_claude(system, question):
+        async for chunk in self._stream(system, question):
             full_response += chunk
         console.print(" " * 10, end="\r")  # clear the "..." line
         console.rule(style="dim")
@@ -286,7 +367,13 @@ class RepoChatCLI:
 
     async def _startup(self) -> None:
         console.rule("[bold]repo-chat[/bold]", style="blue")
-        console.print("[dim]  Ask questions about GitHub repositories without cloning them[/dim]\n")
+        console.print("[dim]  Ask questions about GitHub repositories without cloning them[/dim]")
+        if self.cfg.use_direct_api:
+            model_label = f"  model: {self.cfg.model}" if self.cfg.model else ""
+            console.print(f"[dim]  backend: {self.cfg.api_url}{model_label}[/dim]")
+        else:
+            console.print("[dim]  backend: claude (CLI)[/dim]")
+        console.print()
 
         errors: dict[str, str] = {}
         with console.status(f"[dim]Fetching {len(self.initial_urls)} repo(s)...[/dim]"):
@@ -400,6 +487,8 @@ class RepoChatCLI:
                     console.print(f"\n[red]Error:[/red] {e}")
         finally:
             await self.gh.aclose()
+            if self._api:
+                await self._api.aclose()
 
 
 def main() -> None:
@@ -414,6 +503,6 @@ def main() -> None:
         sys.exit(0 if "--help" in sys.argv or "-h" in sys.argv else 1)
 
     try:
-        asyncio.run(RepoChatCLI(sys.argv[1:]).run())
+        asyncio.run(RepoChatCLI(sys.argv[1:], load_config()).run())
     except KeyboardInterrupt:
         pass
